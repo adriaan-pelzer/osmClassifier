@@ -18,7 +18,7 @@ osmClassifier.o: Makefile osmClassifier.c
 	gcc ${CFLAGS} -c osmClassifier.c -o osmClassifier.o
 
 install:
-	cp osmClassifier /usr/local/lib
+	cp osmClassifier /usr/local/bin
 
 clean:
 	rm *.o; rm core*; rm osmClassifier
