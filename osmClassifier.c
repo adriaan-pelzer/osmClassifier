@@ -11,6 +11,7 @@
 #include <classifier.h>
 #include <parseDir.h>
 #include <corpusToNgrams.h>
+#include <json.h>
 
 #define DAEMON_NAME "osmClassifier"
 #define PID_FILE "/var/run/osmClassifier.pid"
@@ -29,10 +30,11 @@ int sig_restart = 0;
 
 void PrintUsage ( int argc, char *argv[] ) {
     if ( argc > 0 ) {
-        printf ( "Usage: %s -n -d folder -c classification config -h\n", argv[0] );
+        printf ( "Usage: %s -n -i input folder -o output folder -c classification config -h\n", argv[0] );
         printf ( "  Options:\n" );
         printf ( "      -n\tDon't daemonize.\n" );
-        printf ( "      -d folder\tThe folder to read unclassified texts from.\n" );
+        printf ( "      -i folder\tThe folder to read unclassified texts from.\n" );
+        printf ( "      -o folder\tThe folder to write result json to.\n" );
         printf ( "      -c classification config\tThe file that contains the classification config.\n" );
         printf ( "      -h\tShow this help screen.\n" );
         printf ( "\n" );
@@ -63,10 +65,14 @@ void signal_handler ( int sig ) {
     }
 }
 
-int process_file ( fileCtx_t *fileCtx, ngramsLocations_t *ngramsLocations ) {
+int process_file ( fileCtx_t *fileCtx, ngramsLocations_t *ngramsLocations, const char *inFldr, const char *outFldr ) {
     int rc = EXIT_FAILURE;
     char *content = NULL;
     ngrams_t *ngrams = NULL;
+    struct json_object *ngrams_coordinates = NULL;
+    FILE *fp = NULL;
+    char filename[256];
+    char *inFileName = (char *)( fileCtx->fn + strlen ( inFldr ) + 1 );
     size_t i = 0, j = 0;
 
     if ( ( content = get_file_content ( fileCtx ) ) == NULL ) {
@@ -86,8 +92,14 @@ int process_file ( fileCtx_t *fileCtx, ngramsLocations_t *ngramsLocations ) {
         goto over;
     }
 
+    if ( ( ngrams_coordinates = json_object_new_object () ) == NULL ) {
+        syslog ( P_ERR, "Cannot create new json object 'ngrams_coordinates': %m" );
+        goto over;
+    }
+
     for ( i = 0; i < ngrams->max_order; i++ ) {
         for ( j = 0; j < ngrams->orderset[i].size; j++ ) {
+            struct json_object *coordinates = NULL;
             LatLongList_t *lll = NULL;
             size_t k = 0;
 
@@ -98,15 +110,53 @@ int process_file ( fileCtx_t *fileCtx, ngramsLocations_t *ngramsLocations ) {
                 }
             }
 
-            printf ( "%s:", ngrams->orderset[i].ngram[j] );
+            if ( lll ) {
+                if ( ( coordinates = json_object_new_array () ) == NULL ) {
+                    syslog ( P_ERR, "Cannot create new json array 'coordinates': %m" );
+                    goto over;
+                }
 
-            if ( lll )
-                for ( k = 0; k < lll->size; k++ )
-                    printf ( " | %lf,%lf", (double) lll->lat_lon[k].lat, (double) lll->lat_lon[k].lon );
-            else
-                printf ( " not found" );
+                for ( k = 0; k < lll->size; k++ ) {
+                    struct json_object *coordinate = NULL;
+                    struct json_object *lat = NULL;
+                    struct json_object *lon = NULL;
 
-            printf ( "\n" );
+                    if ( ( coordinate = json_object_new_object () ) == NULL ) {
+                        syslog ( P_ERR, "Cannot create new json object 'coordinate': %m" );
+                        goto over;
+                    }
+
+                    if ( ( lat = json_object_new_double ( (double) lll->lat_lon[k].lat ) ) == NULL ) {
+                        syslog ( P_ERR, "Cannot create new json double 'lat': %m" );
+                        goto over;
+                    }
+
+                    if ( ( lon = json_object_new_double ( (double) lll->lat_lon[k].lon ) ) == NULL ) {
+                        syslog ( P_ERR, "Cannot create new json double 'lon': %m" );
+                        goto over;
+                    }
+
+                    if ( json_object_object_add ( coordinate, "lat", lat ) != 0 ) {
+                        syslog ( P_ERR, "Cannot set 'coordinate.lat': %m" );
+                        goto over;
+                    }
+
+                    if ( json_object_object_add ( coordinate, "lon", lon ) != 0 ) {
+                        syslog ( P_ERR, "Cannot set 'coordinate.lon': %m" );
+                        goto over;
+                    }
+
+                    if ( json_object_array_add ( coordinates, coordinate ) != 0 ) {
+                        syslog ( P_ERR, "Cannot set 'coordinate.lon': %m" );
+                        goto over;
+                    }
+                }
+
+                if ( json_object_object_add ( ngrams_coordinates, ngrams->orderset[i].ngram[j], coordinates ) != 0 ) {
+                    syslog ( P_ERR, "Cannot set 'ngrams_coordinates[\"%s\"]: %m", ngrams->orderset[i].ngram[j] );
+                    goto over;
+                }
+            }
         }
     }
 
@@ -115,8 +165,26 @@ int process_file ( fileCtx_t *fileCtx, ngramsLocations_t *ngramsLocations ) {
         goto over;
     }
 
+    snprintf ( filename, 256, "%s/%s", outFldr, inFileName );
+
+    if ( ( fp = fopen ( filename, "w" ) ) == NULL ) {
+        syslog ( P_ERR, "Cannot open file '%s' for writing: %m", filename );
+        goto over;
+    }
+
+    if ( fwrite ( json_object_to_json_string ( ngrams_coordinates ), strlen ( json_object_to_json_string ( ngrams_coordinates ) ), 1, fp ) != 1 ) {
+        syslog ( P_ERR, "Cannot write json string to file: %m" );
+        goto over;
+    }
+
     rc = EXIT_SUCCESS;
 over:
+    if ( fp )
+        fclose ( fp );
+
+    if ( ngrams_coordinates )
+        json_object_put ( ngrams_coordinates );
+
     if ( content )
         free ( content );
 
@@ -134,11 +202,12 @@ int main ( int argc, char **argv ) {
     int daemonize = 1;
 #endif
     char *inputFldr = NULL;
+    char *outputFldr = NULL;
     char *ngramFile = NULL;
     pid_t pid, sid;
     ngramsLocations_t *ngramsLocations = NULL;
 
-    while ( ( c = getopt ( argc, argv, "nd:c:h|help" ) ) != -1 ) {
+    while ( ( c = getopt ( argc, argv, "ni:o:c:h|help" ) ) != -1 ) {
         switch ( c ) {
             case 'h':
                 PrintUsage ( argc, argv );
@@ -147,8 +216,11 @@ int main ( int argc, char **argv ) {
             case 'n':
                 daemonize = 0;
                 break;
-            case 'd':
+            case 'i':
                 inputFldr = optarg; 
+                break;
+            case 'o':
+                outputFldr = optarg;
                 break;
             case 'c':
                 ngramFile = optarg; 
@@ -162,6 +234,12 @@ int main ( int argc, char **argv ) {
 
     if ( inputFldr == NULL ) {
         fprintf ( stderr, "Specify a folder to get texts from\n\n" );
+        PrintUsage ( argc, argv );
+        exit ( EXIT_FAILURE);
+    }
+
+    if ( outputFldr == NULL ) {
+        fprintf ( stderr, "Specify a folder to write results to\n\n" );
         PrintUsage ( argc, argv );
         exit ( EXIT_FAILURE);
     }
@@ -224,7 +302,7 @@ int main ( int argc, char **argv ) {
         fileCtx_t *fileCtx = open_lock_oldest_unlocked_file ( inputFldr );
 
         if ( fileCtx ) {
-            if ( process_file ( fileCtx, ngramsLocations ) != EXIT_SUCCESS )
+            if ( process_file ( fileCtx, ngramsLocations, inputFldr, outputFldr ) != EXIT_SUCCESS )
                 exit ( EXIT_FAILURE );
         } else {
             struct timespec ts;
