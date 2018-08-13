@@ -1,4 +1,4 @@
-CFLAGS=-g -DDEBUG -Wall -fPIC -I/usr/local/include -I/usr/local/include/json-c
+CFLAGS=-Wall -fPIC -I/usr/local/include -I/usr/local/include/json-c
 LIBS=-L/usr/local/lib -lNgramsLocations -lClassifier -lParseDir -lCorpusToNgrams -ljson-c
 
 all: osmClassifier
